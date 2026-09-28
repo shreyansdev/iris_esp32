@@ -47,6 +47,10 @@ DNSServer dnsServer;
 WebServer server(80);
 const byte DNS_PORT = 53;
 
+// Cached Wi-Fi scan results for Captive Portal (avoids blocking 3-4s scans on every HTTP request)
+int cachedScanCount = -1;
+unsigned long lastScanTime = 0;
+
 // On-device Dashboard: unlike the captive portal (only up during setup), this stays
 // running for the device's entire normal operation once connected to home WiFi.
 // Guarded by this flag so repeated WiFi reconnects don't re-register routes / re-begin().
@@ -290,6 +294,7 @@ const unsigned long WEATHER_UPDATE_INTERVAL = 600000; // Fetch fresh weather eve
 // ==================================================
 // MINUTE ROLLOVER & 30-MIN TIMER
 // ==================================================
+const bool ENABLE_MINUTE_CLOCK_POPUP = false; // Set to true if you want the clock to pop up for 3s on every minute change
 int lastObservedMinute = -1;
 bool isMinutePopupActive = false;
 unsigned long minutePopupEndTime = 0;
@@ -326,6 +331,7 @@ String reminderText = "";
 int reminderHour = -1;   // -1 = no reminder armed
 int reminderMinute = 0;
 bool reminderArmed = false;   // true once set, until it fires (or is cleared)
+bool reminderPendingTrigger = false; // latched when scheduled minute arrives, waiting for device to be idle
 bool isReminderPopupActive = false;
 unsigned long reminderPopupEndTime = 0;
 const unsigned long REMINDER_POPUP_DURATION = 15000; // 15 seconds on screen
@@ -444,15 +450,27 @@ void setMood(int newMood, bool forceBlink = true) {
 // MPU6050 FUNCTIONS
 // ==================================================
 void calibrateMPU6050() {
-  // Check if MPU6050 responds on I2C address 0x68 or 0x69
+  // Check if MPU6050 responds on I2C address 0x68
   Wire.beginTransmission(0x68);
   byte error = Wire.endTransmission();
   if (error != 0) {
+    // Check if user has module on 0x69 (AD0 pulled HIGH)
     Wire.beginTransmission(0x69);
-    error = Wire.endTransmission();
-  }
+    byte error69 = Wire.endTransmission();
+    if (error69 == 0) {
+      Serial.println("[MPU6050] Sensor detected at 0x69! The MPU6050_tockn driver requires address 0x68 (connect AD0 to GND).");
+      display.clearDisplay();
+      display.setFont(NULL);
+      display.setCursor(8, 20);
+      display.print("MPU6050 ON 0x69!");
+      display.setCursor(8, 36);
+      display.print("Connect AD0 to GND");
+      display.display();
+      delay(3000);
+      isCalibrated = false;
+      return;
+    }
 
-  if (error != 0) {
     Serial.println("MPU6050 not detected on I2C bus! Check SDA/SCL wiring.");
     display.clearDisplay();
     display.setFont(NULL);
@@ -473,6 +491,9 @@ void calibrateMPU6050() {
   display.setCursor(10, 35);
   display.print("Keep device STILL");
   display.display();
+
+  // Compute gyro bias offsets to eliminate continuous zero-rate drift
+  mpu6050.calcGyroOffsets(false, 200, 200);
 
   float sumX = 0, sumY = 0;
   for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
@@ -600,6 +621,7 @@ void updateMotion() {
     pokeCount = 0;
     isPetting = false;
     isMoodSelecting = false;
+    moodManualOverride = false; // Shake resets manual mood override, returning IRIS to baseline
     currentPage = 0;
     subPage = 0;
 
@@ -733,19 +755,31 @@ const unsigned char* getMiniIcon(String w) {
 }
 
 void updateWeatherMood() {
-  if (weatherMain == "Clear") {
+  String mainCopy = "Clear";
+  float tempCopy = 20.0f;
+
+  if (weatherMutex && xSemaphoreTake(weatherMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    mainCopy = weatherMain;
+    tempCopy = temperature;
+    xSemaphoreGive(weatherMutex);
+  } else {
+    mainCopy = weatherMain;
+    tempCopy = temperature;
+  }
+
+  if (mainCopy == "Clear") {
     weatherMood = MOOD_HAPPY;
-  } else if (weatherMain == "Clouds" || weatherMain == "Mist" || weatherMain == "Smoke" || weatherMain == "Haze" || weatherMain == "Dust" || weatherMain == "Fog") {
+  } else if (mainCopy == "Clouds" || mainCopy == "Mist" || mainCopy == "Smoke" || mainCopy == "Haze" || mainCopy == "Dust" || mainCopy == "Fog") {
     weatherMood = MOOD_GLOOMY;
-  } else if (weatherMain == "Rain" || weatherMain == "Drizzle") {
+  } else if (mainCopy == "Rain" || mainCopy == "Drizzle") {
     weatherMood = MOOD_SAD;
-  } else if (weatherMain == "Thunderstorm") {
+  } else if (mainCopy == "Thunderstorm") {
     weatherMood = MOOD_SURPRISED;
-  } else if (weatherMain == "Snow") {
+  } else if (mainCopy == "Snow") {
     weatherMood = MOOD_SLEEPY;
-  } else if (temperature > 35) {
+  } else if (tempCopy > 35) {
     weatherMood = MOOD_ANGRY;
-  } else if (temperature < 5) {
+  } else if (tempCopy < 5) {
     weatherMood = MOOD_SLEEPY;
   } else {
     weatherMood = MOOD_NORMAL;
@@ -802,12 +836,15 @@ void playWeatherChangeReaction(int reaction) {
 void fetchWeatherAndForecastHttps() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  WiFiClientSecure client;
-  client.setInsecure(); // Skip TLS certificate verification for lightweight embedded HTTPS
-  client.setTimeout(8);
-
-  HTTPClient http;
-  http.setTimeout(8000);
+  // Gracefully skip if OpenWeather API key has not been configured
+  if (strcmp(OPENWEATHER_API_KEY, "YOUR_API_KEY_HERE") == 0) {
+    static bool loggedPlaceholderNotice = false;
+    if (!loggedPlaceholderNotice) {
+      Serial.println("[Weather] Notice: OPENWEATHER_API_KEY is not set ('YOUR_API_KEY_HERE'). Weather updates paused.");
+      loggedPlaceholderNotice = true;
+    }
+    return;
+  }
 
   float tempT = 0, feelsT = 0;
   int humT = 0;
@@ -815,51 +852,69 @@ void fetchWeatherAndForecastHttps() {
   bool currentOk = false;
 
   // 1. Fetch Current Weather via HTTPS
-  String url = "https://api.openweathermap.org/data/2.5/weather?q="
-    + String(CITY) + "," + String(COUNTRY_CODE)
-    + "&appid=" + String(OPENWEATHER_API_KEY) + "&units=metric";
+  {
+    WiFiClientSecure client;
+    client.setInsecure(); // Skip TLS certificate verification for lightweight embedded HTTPS
+    client.setTimeout(8000); // 8000 ms socket timeout
 
-  if (http.begin(client, url)) {
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      String payload = http.getString();
-      JSONVar myObject = JSON.parse(payload);
-      // Validate JSON structure and required keys before indexing
-      if (JSON.typeof(myObject) != "undefined" && myObject.hasOwnProperty("main") && myObject.hasOwnProperty("weather")) {
-        if (myObject["weather"].length() > 0) {
-          tempT  = double(myObject["main"]["temp"]);
-          feelsT = double(myObject["main"]["feels_like"]);
-          humT   = int(myObject["main"]["humidity"]);
-          mainT  = (const char*)myObject["weather"][0]["main"];
-          descT  = (const char*)myObject["weather"][0]["description"];
-          if (descT.length() > 0) descT[0] = toupper(descT[0]);
-          currentOk = true;
+    HTTPClient http;
+    http.setTimeout(8000);
+
+    String url = "https://api.openweathermap.org/data/2.5/weather?q="
+      + String(CITY) + "," + String(COUNTRY_CODE)
+      + "&appid=" + String(OPENWEATHER_API_KEY) + "&units=metric";
+
+    if (http.begin(client, url)) {
+      int httpCode = http.GET();
+      if (httpCode == 200) {
+        String payload = http.getString();
+        JSONVar myObject = JSON.parse(payload);
+        // Validate JSON structure and required keys before indexing
+        if (JSON.typeof(myObject) != "undefined" && myObject.hasOwnProperty("main") && myObject.hasOwnProperty("weather")) {
+          if (myObject["weather"].length() > 0) {
+            tempT  = double(myObject["main"]["temp"]);
+            feelsT = double(myObject["main"]["feels_like"]);
+            humT   = int(myObject["main"]["humidity"]);
+            mainT  = (const char*)myObject["weather"][0]["main"];
+            descT  = (const char*)myObject["weather"][0]["description"];
+            if (descT.length() > 0) descT[0] = toupper(descT[0]);
+            currentOk = true;
+          }
         }
+      } else {
+        Serial.print("Weather HTTPS error, HTTP code: ");
+        Serial.println(httpCode);
       }
-    } else {
-      Serial.print("Weather HTTPS error, HTTP code: ");
-      Serial.println(httpCode);
+      http.end();
+      client.stop(); // Free TLS session and TCP buffers
     }
-    http.end();
-  }
+  } // Scope ends: client and http destructors free mbedTLS buffers (~35KB heap)
 
   // 2. Fetch 5-Day / 3-Hour Forecast via HTTPS
   ForecastDay fcastTemp[3];
   bool forecastOk = false;
 
-  url = "https://api.openweathermap.org/data/2.5/forecast?q="
-    + String(CITY) + "," + String(COUNTRY_CODE)
-    + "&appid=" + String(OPENWEATHER_API_KEY) + "&units=metric";
+  {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(8000);
 
-  if (http.begin(client, url)) {
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      String payload = http.getString();
-      JSONVar fo = JSON.parse(payload);
-      if (JSON.typeof(fo) != "undefined" && fo.hasOwnProperty("list")) {
-        struct tm t;
-        if (getLocalTime(&t, 0)) {
-          int today = t.tm_wday;
+    HTTPClient http;
+    http.setTimeout(8000);
+
+    String url = "https://api.openweathermap.org/data/2.5/forecast?q="
+      + String(CITY) + "," + String(COUNTRY_CODE)
+      + "&appid=" + String(OPENWEATHER_API_KEY) + "&units=metric";
+
+    if (http.begin(client, url)) {
+      int httpCode = http.GET();
+      if (httpCode == 200) {
+        String payload = http.getString();
+        JSONVar fo = JSON.parse(payload);
+        if (JSON.typeof(fo) != "undefined" && fo.hasOwnProperty("list")) {
+          struct tm t;
+          bool hasLocalTime = getLocalTime(&t, 1000); // Allow up to 1000ms for background NTP sync
+          int today = hasLocalTime ? t.tm_wday : -1;
           const char* days[] = { "SUN","MON","TUE","WED","THU","FRI","SAT" };
           // OpenWeatherMap 5-day forecast API returns data in 3-hour steps (8 data points per 24-hour day).
           // Index calculation for roughly +24h, +48h, +72h at approximately the same time of day:
@@ -874,20 +929,30 @@ void fetchWeatherAndForecastHttps() {
             if (idx < listLen && fo["list"][idx].hasOwnProperty("main") && fo["list"][idx].hasOwnProperty("weather") && fo["list"][idx]["weather"].length() > 0) {
               fcastTemp[i].temp     = (int)double(fo["list"][idx]["main"]["temp"]);
               fcastTemp[i].iconType = (const char*)fo["list"][idx]["weather"][0]["main"];
-              int nextDayIndex      = (today + i + 1) % 7;
-              fcastTemp[i].dayName  = days[nextDayIndex];
+              if (today >= 0) {
+                int nextDayIndex     = (today + i + 1) % 7;
+                fcastTemp[i].dayName = days[nextDayIndex];
+              } else if (fo["list"][idx].hasOwnProperty("dt")) {
+                time_t forecastEpoch = (long)fo["list"][idx]["dt"];
+                struct tm fTm;
+                gmtime_r(&forecastEpoch, &fTm);
+                fcastTemp[i].dayName = days[fTm.tm_wday];
+              } else {
+                fcastTemp[i].dayName = "DAY" + String(i + 1);
+              }
             } else {
               forecastOk = false;
             }
           }
         }
+      } else {
+        Serial.print("Forecast HTTPS error, HTTP code: ");
+        Serial.println(httpCode);
       }
-    } else {
-      Serial.print("Forecast HTTPS error, HTTP code: ");
-      Serial.println(httpCode);
+      http.end();
+      client.stop(); // Free TLS session and TCP buffers
     }
-    http.end();
-  }
+  } // Scope ends: client and http destructors free mbedTLS buffers
 
   // Safely commit new weather data under mutex lock
   if (currentOk || forecastOk) {
@@ -912,7 +977,8 @@ void fetchWeatherAndForecastHttps() {
         humidity    = humT;
         weatherMain = mainT;
         weatherDesc = descT;
-        updateWeatherMood();
+        // Notice: updateWeatherMood() is intentionally invoked on the main thread via weatherDataReady
+        // to prevent race conditions on leftEye/rightEye physics and mood structures.
       }
       if (forecastOk) {
         for (int i = 0; i < 3; i++) {
@@ -955,6 +1021,10 @@ void advancePomodoroPhase();
 void stopPomodoro();
 void drawReminderPopup();
 String signalBars(int rssi);
+String escapeHtml(const String& str);
+void initWebServerRoutes();
+void handleWebRoot();
+void handleWebNotFound();
 void handlePortalRoot();
 void handlePortalSave();
 void handlePortalForget();
@@ -1063,8 +1133,8 @@ void handleTouch() {
     }
     // --- ON NON-FACE PAGES (PAGES 1, 2, 3) ---
     else {
-      // Universal Reset / Return Home: Hold 3.0s anywhere to go home
-      if (holdDuration >= 3000 && !isLongPressHandled) {
+      // Universal Reset / Return Home: Hold 3.0s anywhere to go home (unless cycling presets)
+      if (holdDuration >= 3000 && !isLongPressHandled && !isPresetSelecting) {
         currentPage = 0;
         subPage = 0;
         isLongPressHandled = true;
@@ -1136,8 +1206,9 @@ void handleTouch() {
 
     isTimerCancelling = false;
 
-    // Short tap (< 500ms) accumulator
-    if (holdDuration < 500 && !isLongPressHandled) {
+    // Short tap accumulator (anything between 40ms and LONG_PRESS_TIME without a prior action)
+    // 40ms lower threshold filters out RF noise spikes, I2C bus coupling, or power ripple glitches
+    if (holdDuration >= 40 && holdDuration < LONG_PRESS_TIME && !isLongPressHandled) {
       tapCounter++;
       lastTapTime = now;
     }
@@ -1153,6 +1224,10 @@ void handleTouch() {
         setMood(weatherMood);
         currentPage = 0;
         subPage = 0;
+        if (pomodoroAdvancePending) {
+          pomodoroAdvancePending = false;
+          advancePomodoroPhase();
+        }
       } else if (isWeatherPopupActive) {
         isWeatherPopupActive = false;
         currentPage = 0;
@@ -1682,7 +1757,17 @@ void drawWorldClockPage() {
   display.drawLine(42, 16, 42, 63, SH110X_WHITE);
   display.drawLine(85, 16, 85, 63, SH110X_WHITE);
   display.setFont(NULL);
-  display.setCursor(12, 18); display.print("JPR");
+
+  String localLabel = String(CITY);
+  localLabel.trim();
+  localLabel.toUpperCase();
+  if (localLabel == "YOUR_CITY_HERE" || localLabel.length() == 0) {
+    localLabel = "LOC";
+  } else if (localLabel.length() > 3) {
+    localLabel = localLabel.substring(0, 3);
+  }
+  display.setCursor(21 - (localLabel.length() * 3), 18);
+  display.print(localLabel);
   display.setCursor(52, 18); display.print("LDN");
   display.setCursor(94, 18); display.print("NYC");
 
@@ -1705,26 +1790,20 @@ void drawWeatherPage() {
     return;
   }
 
-  String wMain = "Clouds", wDesc = "Sunny";
-  float temp = 0.0, fLike = 0.0;
-  int hum = 0;
+  static String cachedMain = "Clouds", cachedDesc = "Sunny";
+  static float cachedTemp = 0.0, cachedFLike = 0.0;
+  static int cachedHum = 0;
 
   if (weatherMutex && xSemaphoreTake(weatherMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    wMain = weatherMain;
-    wDesc = weatherDesc;
-    temp  = temperature;
-    fLike = feelsLike;
-    hum   = humidity;
+    cachedMain = weatherMain;
+    cachedDesc = weatherDesc;
+    cachedTemp = temperature;
+    cachedFLike = feelsLike;
+    cachedHum   = humidity;
     xSemaphoreGive(weatherMutex);
-  } else {
-    wMain = weatherMain;
-    wDesc = weatherDesc;
-    temp  = temperature;
-    fLike = feelsLike;
-    hum   = humidity;
   }
 
-  display.drawBitmap(96, 0, getBigIcon(wMain), 32, 32, SH110X_WHITE);
+  display.drawBitmap(96, 0, getBigIcon(cachedMain), 32, 32, SH110X_WHITE);
   display.setFont(&FreeSansBold9pt7b);
   String c = CITY; c.toUpperCase();
   display.setCursor(0, 14);
@@ -1732,21 +1811,21 @@ void drawWeatherPage() {
   display.print(c);
 
   display.setFont(&FreeSansBold18pt7b);
-  int tempInt = (int)temp;
+  int tempInt = (int)cachedTemp;
   display.setCursor(0, 48);
   display.print(tempInt);
 
   int16_t x1, y1; uint16_t w, h;
   display.getTextBounds(String(tempInt).c_str(), 0, 48, &x1, &y1, &w, &h);
-  display.fillCircle(x1 + w + 5, 26, 4, SH110X_WHITE);
+  display.drawCircle(x1 + w + 5, 26, 3, SH110X_WHITE);
 
   display.setFont(NULL);
   display.drawBitmap(88, 32, bmp_tiny_drop, 8, 8, SH110X_WHITE);
-  display.setCursor(100, 32); display.print(hum); display.print("%");
-  display.setCursor(88, 45); display.print("~"); display.print((int)fLike);
+  display.setCursor(100, 32); display.print(cachedHum); display.print("%");
+  display.setCursor(88, 45); display.print("~"); display.print((int)cachedFLike);
   display.drawLine(0, 52, 128, 52, SH110X_WHITE);
   display.setCursor(0, 55);
-  String shortDesc = wDesc;
+  String shortDesc = cachedDesc;
   if (shortDesc.length() > 14) shortDesc = shortDesc.substring(0, 12) + "..";
   display.print(shortDesc);
 }
@@ -1765,12 +1844,10 @@ void drawForecastPage() {
   display.drawLine(42, 16, 42, 63, SH110X_WHITE);
   display.drawLine(85, 16, 85, 63, SH110X_WHITE);
 
-  ForecastDay fcastCopy[3];
+  static ForecastDay fcastCopy[3];
   if (weatherMutex && xSemaphoreTake(weatherMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     for (int i = 0; i < 3; i++) fcastCopy[i] = fcast[i];
     xSemaphoreGive(weatherMutex);
-  } else {
-    for (int i = 0; i < 3; i++) fcastCopy[i] = fcast[i];
   }
 
   for (int i = 0; i < 3; i++) {
@@ -1785,7 +1862,7 @@ void drawForecastPage() {
     display.getTextBounds(String(fcastCopy[i].temp).c_str(), 0, 0, &x1, &y1, &w, &h);
     display.setCursor(centerX - w/2 - 2, 58);
     display.print(fcastCopy[i].temp);
-    display.fillCircle(centerX + w/2 + 1, 50, 2, SH110X_WHITE);
+    display.drawCircle(centerX + w/2 + 1, 50, 1, SH110X_WHITE);
   }
 }
 
@@ -1812,7 +1889,6 @@ void drawReminderPopup() {
 
 void drawTimerPage() {
   if (!isTimerActive) {
-    display.clearDisplay();
     display.drawRoundRect(4, 8, 120, 50, 6, SH110X_WHITE); // enlarged from the original (8,10,112,44) to fit the extra hint line below
     display.setFont(&FreeSansBold9pt7b);
     String title = isPresetSelecting
@@ -2067,13 +2143,31 @@ String signalBars(int rssi) {
   return bars;
 }
 
+String escapeHtml(const String& str) {
+  String out = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
+
 void handlePortalRoot() {
-  int n = WiFi.scanNetworks();
+  if (cachedScanCount < 0 || (millis() - lastScanTime > 30000)) {
+    cachedScanCount = WiFi.scanNetworks(false, false);
+    lastScanTime = millis();
+  }
   String options = "";
-  for (int i = 0; i < n; ++i) {
+  for (int i = 0; i < cachedScanCount; ++i) {
     String s = WiFi.SSID(i);
     if (s.length() > 0) {
-      options += "<option value='" + s + "'>" + signalBars(WiFi.RSSI(i)) + " " + s + "</option>";
+      String escaped = escapeHtml(s);
+      options += "<option value='" + escaped + "'>" + signalBars(WiFi.RSSI(i)) + " " + escaped + "</option>";
     }
   }
 
@@ -2114,7 +2208,7 @@ void handlePortalRoot() {
     + options +
     "</select>"
     "<label>WiFi SSID</label>"
-    "<input type='text' id='manual_ssid' value='" + wifiSsid + "' required placeholder='Enter SSID'>"
+    "<input type='text' id='manual_ssid' value='" + escapeHtml(wifiSsid) + "' required placeholder='Enter SSID'>"
     "<label>WiFi Password</label>"
     "<div class='pwrow'>"
     "<input type='password' id='manual_pass' autocomplete='new-password' placeholder='Enter WiFi Password'>"
@@ -2160,7 +2254,7 @@ void handlePortalSave() {
   String s = server.arg("ssid");
   String p = server.arg("pass");
   s.trim();
-  p.trim();
+  // Note: p (password) is intentionally not trimmed to preserve intentional leading/trailing spaces
 
   if (s.length() == 0) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"SSID is required\"}");
@@ -2200,6 +2294,44 @@ void handlePortalNotFound() {
   server.send(302, "text/plain", "");
 }
 
+// Dynamic dispatchers to avoid route collisions between Captive Portal and Dashboard
+void handleWebRoot() {
+  if (inPortalMode) handlePortalRoot();
+  else handleDashboardRoot();
+}
+
+void handleWebNotFound() {
+  if (inPortalMode) handlePortalNotFound();
+  else handleDashboardNotFound();
+}
+
+// Registers all web server routes exactly once on the shared port 80 WebServer
+void initWebServerRoutes() {
+  static bool routesInitialized = false;
+  if (routesInitialized) return;
+  routesInitialized = true;
+
+  // Dynamic Root and Fallback
+  server.on("/", HTTP_GET, handleWebRoot);
+  server.onNotFound(handleWebNotFound);
+
+  // Captive Portal Endpoints
+  server.on("/save", HTTP_POST, handlePortalSave);
+  server.on("/forget", HTTP_POST, handlePortalForget);
+  server.on("/generate_204", handlePortalRoot);
+  server.on("/hotspot-detect.html", handlePortalRoot);
+  server.on("/canonical.html", handlePortalRoot);
+  server.on("/connecttest.txt", handlePortalRoot);
+  server.on("/ncsi.txt", handlePortalRoot);
+
+  // Dashboard Endpoints
+  server.on("/api/state", HTTP_GET, handleApiState);
+  server.on("/api/mood", HTTP_POST, handleApiSetMood);
+  server.on("/api/timer", HTTP_POST, handleApiTimer);
+  server.on("/api/reminder", HTTP_POST, handleApiReminder);
+  server.on("/api/forget-wifi", HTTP_POST, handleApiForgetWifi);
+}
+
 void startCaptivePortal() {
   inPortalMode = true;
   Serial.println("\n[WiFi] ==================================");
@@ -2231,15 +2363,7 @@ void startCaptivePortal() {
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(DNS_PORT, "*", apIP);
 
-  server.on("/", HTTP_GET, handlePortalRoot);
-  server.on("/save", HTTP_POST, handlePortalSave);
-  server.on("/forget", HTTP_POST, handlePortalForget);
-  server.on("/generate_204", handlePortalRoot);
-  server.on("/hotspot-detect.html", handlePortalRoot);
-  server.on("/canonical.html", handlePortalRoot);
-  server.on("/connecttest.txt", handlePortalRoot);
-  server.on("/ncsi.txt", handlePortalRoot);
-  server.onNotFound(handlePortalNotFound);
+  initWebServerRoutes();
   server.begin();
   Serial.println("[WiFi] Captive Portal Web Server started at http://192.168.4.1");
   drawPortalScreen();
@@ -2292,144 +2416,141 @@ int moodNameToSelectableInt(const String& nameIn) {
   return -1;
 }
 
+const char PAGE_DASHBOARD[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'>
+<title>IRIS Dashboard</title>
+<style>
+*{-webkit-tap-highlight-color:transparent;box-sizing:border-box;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#121212;color:#f0f0f0;margin:0;padding:16px;}
+.card{background:#1e1e1e;border-radius:12px;padding:18px;max-width:420px;margin:0 auto 14px;box-shadow:0 4px 16px rgba(0,0,0,0.6);}
+h1{color:#4da6ff;text-align:center;font-size:20px;margin:4px 0 16px;}
+h3{font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.05em;margin:0 0 10px;}
+.stat-row{display:flex;justify-content:space-between;font-size:14px;padding:6px 0;border-bottom:1px solid #2a2a2a;}
+.stat-row:last-child{border-bottom:none;}
+.stat-row b{color:#fff;}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+button{min-height:42px;padding:8px;border:none;border-radius:6px;background:#2a2a2a;color:#eee;font-size:13px;cursor:pointer;}
+button:hover{background:#333;}
+button.active{background:#0070f3;color:#fff;}
+button.wide{grid-column:1/-1;background:#0070f3;color:#fff;font-weight:bold;}
+button.wide:hover{background:#005bb5;}
+button.danger{grid-column:1/-1;background:transparent;border:1px solid #5a2a2a;color:#e88;margin-top:4px;}
+button.danger:hover{border-color:#e74c3c;color:#fff;background:#3a1a1a;}
+input{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#292929;color:#fff;font-size:16px;margin-bottom:8px;}
+label{display:block;font-size:12px;color:#ccc;margin:8px 0 4px;}
+#toast{text-align:center;font-size:13px;min-height:16px;margin-top:8px;}
+#toast.ok{color:#2ecc71;} #toast.err{color:#e74c3c;}
+</style></head><body>
+<h1>IRIS Dashboard</h1>
+<div class='card'><h3>Status</h3>
+<div class='stat-row'><span>Mood</span><b id='s-mood'>-</b></div>
+<div class='stat-row'><span>Weather</span><b id='s-weather'>-</b></div>
+<div class='stat-row'><span>Timer</span><b id='s-timer'>-</b></div>
+<div class='stat-row'><span>Time</span><b id='s-time'>-</b></div>
+<div class='stat-row'><span>WiFi</span><b id='s-wifi'>-</b></div>
+</div>
+<div class='card'><h3>Set Mood</h3><div class='grid' id='moodGrid'></div></div>
+<div class='card'><h3>Timer</h3><div class='grid'>
+<button onclick="timerAction('start',5)">5 min</button>
+<button onclick="timerAction('start',15)">15 min</button>
+<button onclick="timerAction('start',30)">30 min</button>
+<button onclick="timerAction('start',60)">60 min</button>
+<button onclick="timerAction('stop')">Stop</button>
+<button onclick="timerAction('pomodoro_start')">Pomodoro</button>
+</div></div>
+<div class='card'><h3>Sticky-Note Reminder</h3>
+<label>Reminder text</label><input id='remText' maxlength='40' placeholder="e.g. Stand up and stretch">
+<label>Time</label><input id='remTime' type='time'>
+<div class='grid'>
+<button class='wide' onclick='setReminder()'>Set Reminder</button>
+<button class='danger' onclick='clearReminder()'>Clear Reminder</button>
+</div></div>
+<div class='card'><h3>WiFi</h3>
+<div class='grid'><button class='danger' onclick='forgetWifi()'>Forget WiFi &amp; Reconfigure</button></div>
+</div>
+<div id='toast'></div>
+<script>
+var MOODS=['Happy','Love','Sleepy','Excited','Gloomy','Sad','Normal'];
+var grid=document.getElementById('moodGrid');
+MOODS.forEach(function(m){
+  var b=document.createElement('button');b.textContent=m;
+  b.onclick=function(){setMood(m,b);};grid.appendChild(b);
+});
+function toast(msg,cls){var t=document.getElementById('toast');t.textContent=msg;t.className=cls||'';}
+function refresh(){
+  fetch('/api/state').then(function(r){return r.json();}).then(function(d){
+    document.getElementById('s-mood').textContent=d.mood;
+    document.getElementById('s-weather').textContent=d.weather+' '+Math.round(d.tempC)+'\u00B0C';
+    document.getElementById('s-timer').textContent=d.timerActive?
+      (d.pomodoroActive?('POMO '+d.pomodoroPhase.toUpperCase()+' '):'')+
+      Math.floor(d.timerRemainingSec/60)+':'+String(d.timerRemainingSec%60).padStart(2,'0'):'Idle';
+    document.getElementById('s-time').textContent=d.time;
+    document.getElementById('s-wifi').textContent=d.ssid+' ('+d.rssi+' dBm)';
+    Array.from(grid.children).forEach(function(btn){btn.classList.toggle('active',btn.textContent===d.mood);});
+  }).catch(function(){});
+}
+function setMood(m,btn){
+  fetch('/api/mood',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mood='+encodeURIComponent(m)})
+  .then(function(r){if(!r.ok)throw 0;toast('Mood set to '+m,'ok');refresh();})
+  .catch(function(){toast('Could not set mood','err');});
+}
+function timerAction(action,minutes){
+  var body='action='+encodeURIComponent(action);
+  if(minutes)body+='&minutes='+minutes;
+  fetch('/api/timer',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+  .then(function(r){if(!r.ok)throw 0;toast('Timer updated','ok');refresh();})
+  .catch(function(){toast('Could not update timer','err');});
+}
+function setReminder(){
+  var text=document.getElementById('remText').value.trim();
+  var time=document.getElementById('remTime').value;
+  if(!text||!time){toast('Enter both text and a time','err');return;}
+  fetch('/api/reminder',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'text='+encodeURIComponent(text)+'&time='+encodeURIComponent(time)})
+  .then(function(r){if(!r.ok)throw 0;toast('Reminder set for '+time,'ok');})
+  .catch(function(){toast('Could not set reminder','err');});
+}
+function clearReminder(){
+  fetch('/api/reminder',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'clear=1'})
+  .then(function(r){if(!r.ok)throw 0;toast('Reminder cleared','ok');})
+  .catch(function(){toast('Could not clear reminder','err');});
+}
+function forgetWifi(){
+  if(!confirm('IRIS will forget this WiFi network and restart into Setup mode. Continue?'))return;
+  fetch('/api/forget-wifi',{method:'POST'})
+  .then(function(){toast('Forgetting WiFi and restarting...','ok');})
+  .catch(function(){toast('Could not reach IRIS — it may already be restarting.','err');});
+}
+refresh();setInterval(refresh,3000);
+</script></body></html>)rawliteral";
+
 void handleDashboardRoot() {
-  String html = "<!DOCTYPE html><html><head>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'>"
-    "<title>IRIS Dashboard</title>"
-    "<style>"
-    "*{-webkit-tap-highlight-color:transparent;box-sizing:border-box;}"
-    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#121212;color:#f0f0f0;margin:0;padding:16px;}"
-    ".card{background:#1e1e1e;border-radius:12px;padding:18px;max-width:420px;margin:0 auto 14px;box-shadow:0 4px 16px rgba(0,0,0,0.6);}"
-    "h1{color:#4da6ff;text-align:center;font-size:20px;margin:4px 0 16px;}"
-    "h3{font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.05em;margin:0 0 10px;}"
-    ".stat-row{display:flex;justify-content:space-between;font-size:14px;padding:6px 0;border-bottom:1px solid #2a2a2a;}"
-    ".stat-row:last-child{border-bottom:none;}"
-    ".stat-row b{color:#fff;}"
-    ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}"
-    "button{min-height:42px;padding:8px;border:none;border-radius:6px;background:#2a2a2a;color:#eee;font-size:13px;cursor:pointer;}"
-    "button:hover{background:#333;}"
-    "button.active{background:#0070f3;color:#fff;}"
-    "button.wide{grid-column:1/-1;background:#0070f3;color:#fff;font-weight:bold;}"
-    "button.wide:hover{background:#005bb5;}"
-    "button.danger{grid-column:1/-1;background:transparent;border:1px solid #5a2a2a;color:#e88;margin-top:4px;}"
-    "button.danger:hover{border-color:#e74c3c;color:#fff;background:#3a1a1a;}"
-    "input{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#292929;color:#fff;font-size:16px;margin-bottom:8px;}"
-    "label{display:block;font-size:12px;color:#ccc;margin:8px 0 4px;}"
-    "#toast{text-align:center;font-size:13px;min-height:16px;margin-top:8px;}"
-    "#toast.ok{color:#2ecc71;} #toast.err{color:#e74c3c;}"
-    "</style></head><body>"
-    "<h1>IRIS Dashboard</h1>"
-
-    "<div class='card'><h3>Status</h3>"
-    "<div class='stat-row'><span>Mood</span><b id='s-mood'>-</b></div>"
-    "<div class='stat-row'><span>Weather</span><b id='s-weather'>-</b></div>"
-    "<div class='stat-row'><span>Timer</span><b id='s-timer'>-</b></div>"
-    "<div class='stat-row'><span>Time</span><b id='s-time'>-</b></div>"
-    "<div class='stat-row'><span>WiFi</span><b id='s-wifi'>-</b></div>"
-    "</div>"
-
-    "<div class='card'><h3>Set Mood</h3><div class='grid' id='moodGrid'></div></div>"
-
-    "<div class='card'><h3>Timer</h3><div class='grid'>"
-    "<button onclick=\"timerAction('start',5)\">5 min</button>"
-    "<button onclick=\"timerAction('start',15)\">15 min</button>"
-    "<button onclick=\"timerAction('start',30)\">30 min</button>"
-    "<button onclick=\"timerAction('start',60)\">60 min</button>"
-    "<button onclick=\"timerAction('stop')\">Stop</button>"
-    "<button onclick=\"timerAction('pomodoro_start')\">Pomodoro</button>"
-    "</div></div>"
-
-    "<div class='card'><h3>Sticky-Note Reminder</h3>"
-    "<label>Reminder text</label><input id='remText' maxlength='40' placeholder=\"e.g. Stand up and stretch\">"
-    "<label>Time</label><input id='remTime' type='time'>"
-    "<div class='grid'>"
-    "<button class='wide' onclick='setReminder()'>Set Reminder</button>"
-    "<button class='danger' onclick='clearReminder()'>Clear Reminder</button>"
-    "</div></div>"
-
-    "<div class='card'><h3>WiFi</h3>"
-    "<div class='grid'><button class='danger' onclick='forgetWifi()'>Forget WiFi &amp; Reconfigure</button></div>"
-    "</div>"
-
-    "<div id='toast'></div>"
-
-    "<script>"
-    "var MOODS=" + String("['Happy','Love','Sleepy','Excited','Gloomy','Sad','Normal']") + ";"
-    "var grid=document.getElementById('moodGrid');"
-    "MOODS.forEach(function(m){"
-      "var b=document.createElement('button');b.textContent=m;"
-      "b.onclick=function(){setMood(m,b);};grid.appendChild(b);"
-    "});"
-    "function toast(msg,cls){var t=document.getElementById('toast');t.textContent=msg;t.className=cls||'';}"
-    "function refresh(){"
-      "fetch('/api/state').then(function(r){return r.json();}).then(function(d){"
-        "document.getElementById('s-mood').textContent=d.mood;"
-        "document.getElementById('s-weather').textContent=d.weather+' '+Math.round(d.tempC)+'\\u00B0C';"
-        "document.getElementById('s-timer').textContent=d.timerActive?"
-          "(d.pomodoroActive?('POMO '+d.pomodoroPhase.toUpperCase()+' '):'')+"
-          "Math.floor(d.timerRemainingSec/60)+':'+String(d.timerRemainingSec%60).padStart(2,'0'):'Idle';"
-        "document.getElementById('s-time').textContent=d.time;"
-        "document.getElementById('s-wifi').textContent=d.ssid+' ('+d.rssi+' dBm)';"
-        "Array.from(grid.children).forEach(function(btn){btn.classList.toggle('active',btn.textContent===d.mood);});"
-      "}).catch(function(){});"
-    "}"
-    "function setMood(m,btn){"
-      "fetch('/api/mood',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mood='+encodeURIComponent(m)})"
-      ".then(function(r){if(!r.ok)throw 0;toast('Mood set to '+m,'ok');refresh();})"
-      ".catch(function(){toast('Could not set mood','err');});"
-    "}"
-    "function timerAction(action,minutes){"
-      "var body='action='+encodeURIComponent(action);"
-      "if(minutes)body+='&minutes='+minutes;"
-      "fetch('/api/timer',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
-      ".then(function(r){if(!r.ok)throw 0;toast('Timer updated','ok');refresh();})"
-      ".catch(function(){toast('Could not update timer','err');});"
-    "}"
-    "function setReminder(){"
-      "var text=document.getElementById('remText').value.trim();"
-      "var time=document.getElementById('remTime').value;"
-      "if(!text||!time){toast('Enter both text and a time','err');return;}"
-      "fetch('/api/reminder',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-        "body:'text='+encodeURIComponent(text)+'&time='+encodeURIComponent(time)})"
-      ".then(function(r){if(!r.ok)throw 0;toast('Reminder set for '+time,'ok');})"
-      ".catch(function(){toast('Could not set reminder','err');});"
-    "}"
-    "function clearReminder(){"
-      "fetch('/api/reminder',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'clear=1'})"
-      ".then(function(r){if(!r.ok)throw 0;toast('Reminder cleared','ok');})"
-      ".catch(function(){toast('Could not clear reminder','err');});"
-    "}"
-    "function forgetWifi(){"
-      "if(!confirm('IRIS will forget this WiFi network and restart into Setup mode. Continue?'))return;"
-      "fetch('/api/forget-wifi',{method:'POST'})"
-      ".then(function(){toast('Forgetting WiFi and restarting...','ok');})"
-      ".catch(function(){toast('Could not reach IRIS — it may already be restarting.','err');});"
-    "}"
-    "refresh();setInterval(refresh,3000);"
-    "</script></body></html>";
-
-  server.send(200, "text/html", html);
+  server.send_P(200, "text/html", PAGE_DASHBOARD);
 }
 
 void handleApiState() {
   JSONVar obj;
   obj["mood"] = String(moodIntToName(currentMood));
 
-  float tempCopy; String mainCopy, descCopy;
+  static float cachedStateTemp = 0.0;
+  static String cachedStateMain = "Clear", cachedStateDesc = "Sunny";
   if (weatherMutex && xSemaphoreTake(weatherMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    tempCopy = temperature; mainCopy = weatherMain; descCopy = weatherDesc;
+    cachedStateTemp = temperature;
+    cachedStateMain = weatherMain;
+    cachedStateDesc = weatherDesc;
     xSemaphoreGive(weatherMutex);
-  } else {
-    tempCopy = temperature; mainCopy = weatherMain; descCopy = weatherDesc;
   }
-  obj["tempC"] = tempCopy;
-  obj["weather"] = mainCopy;
-  obj["weatherDesc"] = descCopy;
+  obj["tempC"] = cachedStateTemp;
+  obj["weather"] = cachedStateMain;
+  obj["weatherDesc"] = cachedStateDesc;
 
   obj["timerActive"] = isTimerActive;
   obj["pomodoroActive"] = pomodoroActive;
   obj["pomodoroPhase"] = String(pomodoroPhase == 0 ? "work" : "break");
-  unsigned long remain = (isTimerActive && timerEndTime > millis()) ? (timerEndTime - millis()) : 0;
+  unsigned long remain = 0;
+  if (isTimerActive && (long)(timerEndTime - millis()) > 0) {
+    remain = timerEndTime - millis();
+  }
   obj["timerRemainingSec"] = (int)(remain / 1000);
   obj["timerPresetMin"] = TIMER_PRESETS_MIN[selectedPresetIndex];
 
@@ -2558,13 +2679,7 @@ void startDashboardServer() {
   if (dashboardStarted) return;
   dashboardStarted = true;
 
-  server.on("/", HTTP_GET, handleDashboardRoot);
-  server.on("/api/state", HTTP_GET, handleApiState);
-  server.on("/api/mood", HTTP_POST, handleApiSetMood);
-  server.on("/api/timer", HTTP_POST, handleApiTimer);
-  server.on("/api/reminder", HTTP_POST, handleApiReminder);
-  server.on("/api/forget-wifi", HTTP_POST, handleApiForgetWifi);
-  server.onNotFound(handleDashboardNotFound);
+  initWebServerRoutes();
   server.begin();
 
   Serial.println("[Web] ==================================");
@@ -2785,7 +2900,7 @@ void startWifiConnection() {
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   esp_wifi_set_max_tx_power(WIFI_POWER_8_5dBm);
   WiFi.scanDelete();
-  WiFi.scanNetworks(true, false); // async = true, don't include hidden networks
+  WiFi.scanNetworks(true, true); // async = true, show_hidden = true (detects hidden SSIDs)
   wifiScanStartTime = millis();
   wifiState = WIFI_STATE_SCANNING;
   Serial.print("[WiFi] Scanning for '");
@@ -2850,6 +2965,7 @@ void onWifiConnectedCelebration() {
   configTime(0, 0, "pool.ntp.org");
   setenv("TZ", TIMEZONE, 1);
   tzset();
+  updateDisplayContrast(); // Apply night/day dimming contrast as soon as time environment is set
 
   // 5. Wake up background FreeRTOS weather task immediately
   if (weatherTaskHandle != NULL) {
@@ -2911,12 +3027,22 @@ void updateWifiBackground() {
       Serial.println("[WiFi] Saved network is in range. Connecting...");
       beginWifiConnectionAttempt();
     } else {
-      // Genuinely out of range — skip the retry counter entirely and go straight
-      // to the Setup AP instead of burning through connection timeouts for nothing.
-      Serial.println("[WiFi] Saved network not found nearby. Skipping straight to Setup AP...");
-      wifiFailedAttempts = 0;
-      playConfusedSearchingAnimation();
-      startCaptivePortal();
+      wifiFailedAttempts++;
+      Serial.print("[WiFi] Saved network not found in scan pass (");
+      Serial.print(wifiFailedAttempts);
+      Serial.print("/");
+      Serial.print(WIFI_MAX_ATTEMPTS_BEFORE_PORTAL);
+      Serial.println("). Attempting direct probe connection...");
+
+      if (wifiFailedAttempts >= WIFI_MAX_ATTEMPTS_BEFORE_PORTAL) {
+        Serial.println("[WiFi] Saved network unreachable after repeated scans. Opening Setup AP...");
+        wifiFailedAttempts = 0;
+        playConfusedSearchingAnimation();
+        startCaptivePortal();
+        return;
+      }
+      // Attempt direct probe connection in case network is hidden or scan pass missed beacon
+      beginWifiConnectionAttempt();
     }
     return;
   }
@@ -2972,7 +3098,8 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000); // 400kHz Fast I2C mode for smooth 60fps rendering
-  pinMode(TOUCH_PIN, INPUT_PULLUP);
+  pinMode(TOUCH_PIN, INPUT);
+  randomSeed(esp_random()); // Seed hardware PRNG
 
   if (!display.begin(0x3C, true)) {
     Serial.println("[Display] Note: SH1106 not found on 0x3C. If connected, check SDA(6) & SCL(7).");
@@ -2992,8 +3119,20 @@ void setup() {
   Serial.print(wifiSsid);
   Serial.println("'");
 
-  // If no SSID configured or if user touches/holds TOUCH_PIN at boot, enter Captive Portal mode
-  if (wifiSsid.length() == 0 || digitalRead(TOUCH_PIN) == HIGH) {
+  // If no SSID configured or if user deliberately holds TOUCH_PIN for 1.5s at boot, enter Captive Portal mode
+  bool forceSetup = false;
+  if (digitalRead(TOUCH_PIN) == HIGH) {
+    unsigned long pressStart = millis();
+    while (digitalRead(TOUCH_PIN) == HIGH && (millis() - pressStart < 1500)) {
+      delay(20);
+    }
+    if (millis() - pressStart >= 1500) {
+      forceSetup = true;
+      Serial.println("[Boot] Touch held for 1.5s at boot — starting Captive Portal setup.");
+    }
+  }
+
+  if (wifiSsid.length() == 0 || forceSetup) {
     startCaptivePortal();
     return;
   }
@@ -3004,12 +3143,12 @@ void setup() {
   leftEye.init(28, 18, 32, 32);
   rightEye.init(80, 18, 32, 32);
 
-  // Initialize FreeRTOS mutex and background weather task
+  // Initialize FreeRTOS mutex and background weather task (10KB stack for TLS + HTTPClient + JSON)
   weatherMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(
     weatherTaskCode,
     "WeatherTask",
-    8192,
+    10240,
     NULL,
     1,
     &weatherTaskHandle,
@@ -3089,26 +3228,43 @@ void playPageTransition() {
   static uint8_t oldFrame[FRAME_BUF_BYTES];
   static uint8_t newFrame[FRAME_BUF_BYTES];
 
-  // 1. Whatever is already on screen from the previous frame IS the "old" page — capture it
-  //    before drawing anything new over it.
-  captureFrame(oldFrame);
+  uint8_t* dispBuf = display.getBuffer();
+  if (dispBuf) {
+    memcpy(oldFrame, dispBuf, FRAME_BUF_BYTES);
+  } else {
+    captureFrame(oldFrame);
+  }
 
-  // 2. Render the new page into the buffer (off-screen from the user's perspective, since we
-  //    haven't called display.display() yet) and capture that as the "new" page.
   display.clearDisplay();
   renderCurrentFrame();
-  captureFrame(newFrame);
 
-  // 3. Wipe: reveal progressively more of the new frame from the left, showing the old
-  //    frame's remainder on the right, until the whole screen is the new page.
+  if (dispBuf) {
+    memcpy(newFrame, dispBuf, FRAME_BUF_BYTES);
+  } else {
+    captureFrame(newFrame);
+  }
+
+  // Fast vertical page wipe: SH1106 memory is arranged in 8 horizontal pages of 128 vertical byte-slices
   const int STEPS = 6;
   for (int step = 1; step <= STEPS; step++) {
     int revealX = (SCREEN_WIDTH * step) / STEPS;
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-      for (int x = 0; x < SCREEN_WIDTH; x++) {
-        bool useNew = x < revealX;
-        bool on = useNew ? getFrameBit(newFrame, x, y) : getFrameBit(oldFrame, x, y);
-        display.drawPixel(x, y, on ? SH110X_WHITE : SH110X_BLACK);
+    if (dispBuf) {
+      for (int p = 0; p < 8; p++) {
+        int pageOffset = p * SCREEN_WIDTH;
+        if (revealX > 0) {
+          memcpy(dispBuf + pageOffset, newFrame + pageOffset, revealX);
+        }
+        if (revealX < SCREEN_WIDTH) {
+          memcpy(dispBuf + pageOffset + revealX, oldFrame + pageOffset + revealX, SCREEN_WIDTH - revealX);
+        }
+      }
+    } else {
+      for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+          bool useNew = x < revealX;
+          bool on = useNew ? getFrameBit(newFrame, x, y) : getFrameBit(oldFrame, x, y);
+          display.drawPixel(x, y, on ? SH110X_WHITE : SH110X_BLACK);
+        }
       }
     }
     display.display();
@@ -3145,7 +3301,7 @@ void loop() {
   }
 
   // Handle Timer auto-completion -> non-blocking BOOM! (also covers each Pomodoro phase ending)
-  if (isTimerActive && millis() >= timerEndTime) {
+  if (isTimerActive && (long)(millis() - timerEndTime) >= 0) {
     isTimerActive = false;
     currentPage = 0;
     subPage = 0;
@@ -3157,19 +3313,21 @@ void loop() {
     }
   }
 
-  // Handle 3-second time display on every minute change (non-blocking 0ms)
+  // Handle 3-second time display on every minute change (non-blocking 0ms, opt-in via ENABLE_MINUTE_CLOCK_POPUP)
   // Guarded against interrupting active interactions, emotions, or navigation
-  struct tm t;
-  if (getLocalTime(&t, 0)) {
-    if (lastObservedMinute != -1 && t.tm_min != lastObservedMinute) {
-      if (!isTimerActive && !isWeatherPopupActive && !isShaking && !isAngry && 
-          !isRecovering && !isSuspicious && !isTouchAngry && !isBoomActive && 
-          !isPetting && !isMoodSelecting && (millis() - lastUserInteractionTime > 3000)) {
-        isMinutePopupActive = true;
-        minutePopupEndTime = millis() + MINUTE_POPUP_DURATION;
+  if (ENABLE_MINUTE_CLOCK_POPUP) {
+    struct tm t;
+    if (getLocalTime(&t, 0)) {
+      if (lastObservedMinute != -1 && t.tm_min != lastObservedMinute) {
+        if (!isTimerActive && !isWeatherPopupActive && !isShaking && !isAngry && 
+            !isRecovering && !isSuspicious && !isTouchAngry && !isBoomActive && 
+            !isPetting && !isMoodSelecting && (millis() - lastUserInteractionTime > 3000)) {
+          isMinutePopupActive = true;
+          minutePopupEndTime = millis() + MINUTE_POPUP_DURATION;
+        }
       }
+      lastObservedMinute = t.tm_min;
     }
-    lastObservedMinute = t.tm_min;
   }
 
   // Handle minute change popup expiration
@@ -3177,19 +3335,23 @@ void loop() {
     isMinutePopupActive = false;
   }
 
-  // Fire the sticky-note reminder at its scheduled time (set via the Dashboard). Fires once
-  // (reminderArmed is cleared immediately) so it can't re-trigger repeatedly within the same minute.
+  // Latch sticky-note reminder at scheduled time, then pop up as soon as device is idle
   if (reminderArmed) {
     struct tm rt;
     if (getLocalTime(&rt, 0) && rt.tm_hour == reminderHour && rt.tm_min == reminderMinute) {
-      if (!isBoomActive && !isShaking && !isAngry && !isRecovering) {
-        reminderArmed = false;
-        isReminderPopupActive = true;
-        reminderPopupEndTime = millis() + REMINDER_POPUP_DURATION;
-        if (currentPage != 0 || subPage != 0) pageTransitionPending = true;
-        currentPage = 0;
-        subPage = 0;
-      }
+      reminderArmed = false;
+      reminderPendingTrigger = true;
+    }
+  }
+
+  if (reminderPendingTrigger) {
+    if (!isBoomActive && !isShaking && !isAngry && !isRecovering) {
+      reminderPendingTrigger = false;
+      isReminderPopupActive = true;
+      reminderPopupEndTime = millis() + REMINDER_POPUP_DURATION;
+      if (currentPage != 0 || subPage != 0) pageTransitionPending = true;
+      currentPage = 0;
+      subPage = 0;
     }
   }
 
@@ -3206,9 +3368,10 @@ void loop() {
   }
 
   // Handle newly arrived background weather data
-  // Only auto-pop if the user has been idle on the Face page (>10s) and not actively interacting
+  // Safely trigger mood updates on the main loop thread, and auto-pop weather if idle on Face page
   if (weatherDataReady) {
     weatherDataReady = false;
+    updateWeatherMood();
     if (currentPage == 0 && !isTimerActive && !isBoomActive && 
         !isShaking && !isAngry && !isRecovering && !isSuspicious && 
         !isTouchAngry && !isPetting && !isMoodSelecting && 

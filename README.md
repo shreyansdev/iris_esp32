@@ -53,7 +53,7 @@ There is no companion app. WiFi is set up from your phone through a captive port
 
 **Connectivity**
 - Captive portal for WiFi setup with signal-strength bars, a password show/hide toggle and a Forget Saved Network button.
-- Saved credentials live in flash. On boot, and on any later disconnect, IRIS scans first. If your saved network is not visible at all it reopens the setup portal right away, so you can move it to a new network without reflashing. If the network is visible but the connection keeps failing (3 attempts), it reopens the portal as well. Saving new credentials replaces the old ones.
+- Saved credentials live in flash. On boot, and on any later disconnect, IRIS scans first (including hidden networks). If your network is not detected in the initial scan pass, it automatically attempts directed probe connections. If connection fails repeatedly (3 attempts), it reopens the setup portal so you can move it to a new network without reflashing. Saving new credentials replaces the old ones.
 - The setup access point is password protected.
 - Permanent on-device web dashboard at the device's IP address, or `http://iris.local` where mDNS is supported.
 
@@ -190,7 +190,7 @@ New OpenWeatherMap keys can take a while to activate after you create them.
 4. Pick your network from the list (bars show signal strength, `[####]` is strongest), enter the password, and tap **Save & Connect**.
 5. IRIS restarts, connects, plays a short celebration, and shows its dashboard address for a few seconds.
 
-To force setup mode later, hold the touch sensor while powering on, or use **Forget WiFi & Reconfigure** on the dashboard. If your saved network disappears (you took IRIS somewhere else), it opens the setup portal on its own.
+To force setup mode later, hold the touch sensor for 1.5 seconds while powering on, or use **Forget WiFi & Reconfigure** on the dashboard. If your saved network disappears (you took IRIS somewhere else), it opens the setup portal on its own after retrying.
 
 ## Using IRIS
 
@@ -202,7 +202,7 @@ Everything is done with one touch sensor.
 | Face | Double tap | Poke. Pokes 1 and 2 make it suspicious, a 3rd within 3.5 s makes it angry |
 | Face | Hold 0.8 s to 2.5 s | Petting, switches to Love |
 | Face | Hold 2.5 s or more | Mood picker: cycles through 7 moods while held, release to lock one in |
-| Clock | Double tap or hold | Toggle World Clock |
+| Clock | Double tap or hold | Toggle World Clock (displays London, New York, and your configured city with dynamic 3-letter abbreviation) |
 | Weather | Double tap or hold | Toggle 3-day Forecast |
 | Timer (idle) | Double tap | Start the timer |
 | Timer (idle) | Hold | Cycle presets: 5, 15, 30, 60 minutes |
@@ -269,7 +269,7 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 
 **Weather task.** A FreeRTOS task fetches current weather and the 5-day forecast over HTTPS every 10 minutes and writes the result under a mutex. It never draws anything. When a reading changes meaningfully it sets a flag, and the main loop plays the matching reaction. Reactions only play when IRIS is idle on the Face page. Otherwise they are dropped rather than queued.
 
-**WiFi state machine.** Connecting is non-blocking: scan for the saved SSID, connect, and retry. An SSID that is not in the scan results goes straight to the setup portal. A visible SSID that fails to connect is retried up to 3 times (15 s timeout, 8 s between attempts) before the portal reopens.
+**WiFi state machine.** Connecting is non-blocking: scan for the saved SSID (including hidden networks), connect, and retry. If a scan pass misses the beacon or the network is hidden, IRIS attempts directed probe connection before reopening the portal. A visible or probed SSID that fails to connect is retried up to 3 times (15 s timeout, 8 s between attempts) before the portal reopens.
 
 **Page transitions.** The old and new frames are captured through `getPixel()` into 1 KB buffers, then composited in 6 steps. This uses only the public Adafruit GFX API, so it does not depend on the display driver's internal buffer layout. Most of the time cost is the I2C push of each frame.
 
@@ -283,6 +283,7 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 | `WIFI_TIMEOUT`, `WIFI_RETRY_INTERVAL`, `WIFI_MAX_ATTEMPTS_BEFORE_PORTAL` | WiFi section | How long IRIS tries a saved network before reopening the portal |
 | `WEATHER_REACTION_TEMP_DELTA` | weather section | Temperature swing that triggers a reaction (default 5 C) |
 | `WEATHER_UPDATE_INTERVAL` | weather section | Weather refresh period (default 10 minutes) |
+| `ENABLE_MINUTE_CLOCK_POPUP` | clock section | Brief 3-second time popup on every minute change (default `false`) |
 | `TIMER_PRESETS_MIN` | timer section | Preset durations |
 | `POMODORO_WORK_MS`, `POMODORO_BREAK_MS` | timer section | Pomodoro lengths |
 | `STEPS` in `playPageTransition()` | rendering section | Fewer steps is faster, more is smoother |
