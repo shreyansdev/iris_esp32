@@ -1,0 +1,23 @@
+# Arduino / ESP32 build artifacts
+*.hex
+*.bin
+*.elf
+*.o
+*.a
+*.d
+
+# PlatformIO & Arduino CLI build directories
+.pio/
+build/
+bin/
+
+# IDE and Editor configurations
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
