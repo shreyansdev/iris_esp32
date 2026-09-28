@@ -37,12 +37,13 @@ There is no companion app. WiFi is set up from your phone through a captive port
 - Hold the face to pet it and it switches to Love.
 
 **Pages**
-- Face, Clock (with a World Clock subpage), Weather (with a 3-day Forecast subpage), and Timer.
-- A quick left-to-right wipe transition when you change pages.
+- Face, Clock (with a World Clock subpage showing London, New York, and your configured city), Weather (with a 3-day Forecast subpage), and Timer.
+- A quick left-to-right wipe transition when you change pages (sub-millisecond direct display buffer compositing).
+- Optional minute change clock popup (`ENABLE_MINUTE_CLOCK_POPUP`), displaying the time for 3 seconds whenever the minute rolls over if the device is idle.
 
 **Weather**
-- Current conditions and a 3-day forecast from OpenWeatherMap, refreshed every 10 minutes by a background task so the animation never stalls on the network.
-- The weather sets IRIS's baseline mood (clear is happy, rain is sad, thunderstorm is surprised, and so on).
+- Current conditions and a 3-day forecast from OpenWeatherMap, refreshed every 10 minutes by a background FreeRTOS task so the animation never stalls on the network.
+- The weather sets IRIS's baseline mood (clear is happy, rain is sad, thunderstorm is surprised, and so on). A physical shake resets any manual mood override back to this weather baseline.
 - Weather-change reactions: a temperature drop of 5 C or more makes it shiver, a rise of 5 C or more makes it wilt, and a thunderstorm starting makes it jump with surprise.
 
 **Timer, Pomodoro and reminders**
@@ -265,13 +266,13 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 
 ## How it works
 
-**Rendering.** The main `loop()` reads touch and motion, services the web server, updates eye physics, and draws one frame at roughly 60 fps. Only this loop ever touches the display. The ESP32-C3 is single-core, so the design avoids two tasks sharing the I2C bus.
+**Rendering.** The main `loop()` reads touch (with a 40ms noise debounce filter) and motion, services the web server, updates eye physics, and draws one frame at roughly 60 fps. Only this loop ever touches the display. The ESP32-C3 is single-core, so the background FreeRTOS weather task is pinned to Core 0 (`CONFIG_FREERTOS_UNICORE=y` compliant), and dashboard HTML is streamed from flash (`PROGMEM`) to eliminate heap fragmentation.
 
 **Weather task.** A FreeRTOS task fetches current weather and the 5-day forecast over HTTPS every 10 minutes and writes the result under a mutex. It never draws anything. When a reading changes meaningfully it sets a flag, and the main loop plays the matching reaction. Reactions only play when IRIS is idle on the Face page. Otherwise they are dropped rather than queued.
 
 **WiFi state machine.** Connecting is non-blocking: scan for the saved SSID (including hidden networks), connect, and retry. If a scan pass misses the beacon or the network is hidden, IRIS attempts directed probe connection before reopening the portal. A visible or probed SSID that fails to connect is retried up to 3 times (15 s timeout, 8 s between attempts) before the portal reopens.
 
-**Page transitions.** The old and new frames are captured through `getPixel()` into 1 KB buffers, then composited in 6 steps. This uses only the public Adafruit GFX API, so it does not depend on the display driver's internal buffer layout. Most of the time cost is the I2C push of each frame.
+**Page transitions.** The transition engine uses direct display memory buffer slicing (`display.getBuffer()`) for sub-millisecond page frame capture and 6-step column-wise wipe compositing, with an automatic fallback to `getPixel()`/`drawPixel()` if direct buffer access is unavailable.
 
 **Storage.** WiFi credentials are stored with `Preferences` (NVS) under the `iris-wifi` namespace. Timer presets, Pomodoro state and reminders live in RAM only.
 
@@ -297,7 +298,7 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 
 **Blank screen.** Check the wiring and that your OLED is an SH1106 at `0x3C`. Serial prints a note if the display is not found.
 
-**"MPU6050 NOT FOUND" on screen.** Check SDA and SCL wiring and power. The sketch looks for the sensor at `0x68` and `0x69`.
+**"MPU6050 NOT FOUND" or "MPU6050 ON 0x69" on screen.** Check SDA and SCL wiring and power. The sketch verifies I2C address `0x68` and warns on-screen if the sensor is detected at `0x69` (connect AD0 to GND so the `MPU6050_tockn` driver can communicate).
 
 **No Serial output.** Enable **USB CDC On Boot** in the Arduino IDE board settings and use 115200 baud.
 
