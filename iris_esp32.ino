@@ -7,6 +7,7 @@
 #include <esp_wifi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -951,6 +952,7 @@ bool getFrameBit(const uint8_t* buf, int x, int y);
 void playPageTransition();
 void updateDisplayContrast();
 void advancePomodoroPhase();
+void stopPomodoro();
 void drawReminderPopup();
 String signalBars(int rssi);
 void handlePortalRoot();
@@ -1085,6 +1087,7 @@ void handleTouch() {
         }
         if (holdDuration >= TIMER_CANCEL_HOLD_TIME && !isLongPressHandled) {
           isTimerActive = false;
+          stopPomodoro();
           isTimerCancelling = false;
           startBoomAnimation();
           currentPage = 0;
@@ -1212,6 +1215,7 @@ void handleTouch() {
             timerEndTime = now + timerDuration;
           } else {
             isTimerActive = false;
+            stopPomodoro();
             currentPage = 0;
             subPage = 0;
             startBoomAnimation();
@@ -1987,6 +1991,15 @@ void drawBoomAnimation() {
   }
 }
 
+// Ends Pomodoro mode and restores the timer duration to the selected preset. Without the
+// restore, the leftover 25/5 minute Pomodoro duration would silently be used for the next
+// normal timer, while the idle Timer page still showed the preset.
+void stopPomodoro() {
+  pomodoroActive = false;
+  pomodoroAdvancePending = false;
+  timerDuration = (unsigned long)TIMER_PRESETS_MIN[selectedPresetIndex] * 60UL * 1000UL;
+}
+
 // Switches an active Pomodoro session between its Work and Break phases and restarts
 // the underlying timer with that phase's duration. Called once the boom celebration for
 // the just-finished phase has fully played out (see drawBoomAnimation()'s Completed branch).
@@ -2104,7 +2117,7 @@ void handlePortalRoot() {
     "<input type='text' id='manual_ssid' value='" + wifiSsid + "' required placeholder='Enter SSID'>"
     "<label>WiFi Password</label>"
     "<div class='pwrow'>"
-    "<input type='password' id='manual_pass' value='" + wifiPassword + "' placeholder='Enter WiFi Password'>"
+    "<input type='password' id='manual_pass' autocomplete='new-password' placeholder='Enter WiFi Password'>"
     "<button type='button' class='pwtoggle' onclick=\"var p=document.getElementById('manual_pass');var show=p.type==='password';p.type=show?'text':'password';this.textContent=show?'HIDE':'SHOW';\">SHOW</button>"
     "</div>"
     "<button type='button' class='primary' id='saveBtn' onclick='saveWifi()'>Save &amp; Connect</button>"
@@ -2459,18 +2472,17 @@ void handleApiTimer() {
   unsigned long now = millis();
 
   if (action == "start") {
+    stopPomodoro(); // also resets any leftover Pomodoro duration before applying the requested one
     if (server.hasArg("minutes")) {
       int mins = server.arg("minutes").toInt();
       if (mins > 0 && mins <= 180) timerDuration = (unsigned long)mins * 60UL * 1000UL;
     }
-    pomodoroActive = false;
     isTimerActive = true;
     timerStartTime = now;
     timerEndTime = now + timerDuration;
   } else if (action == "stop") {
     isTimerActive = false;
-    pomodoroActive = false;
-    pomodoroAdvancePending = false;
+    stopPomodoro();
     currentPage = 0;
     subPage = 0;
     startBoomAnimation();
@@ -2554,7 +2566,16 @@ void startDashboardServer() {
   server.on("/api/forget-wifi", HTTP_POST, handleApiForgetWifi);
   server.onNotFound(handleDashboardNotFound);
   server.begin();
-  Serial.println("[Web] Dashboard server started.");
+
+  Serial.println("[Web] ==================================");
+  Serial.print("[Web] Dashboard: http://");
+  Serial.println(WiFi.localIP());
+  if (MDNS.begin("iris")) {
+    Serial.println("[Web] Also reachable at: http://iris.local");
+  } else {
+    Serial.println("[Web] mDNS failed to start — use the IP address above instead.");
+  }
+  Serial.println("[Web] ==================================");
 }
 
 void playBootAnimation() {
@@ -2836,7 +2857,25 @@ void onWifiConnectedCelebration() {
   }
 
   // 6. Start the on-device Dashboard (idempotent — safe to call again on later reconnects)
+  bool isFirstDashboardStart = !dashboardStarted;
   startDashboardServer();
+
+  // 7. On the very first connection only, show where to find the Dashboard. Skipped on
+  // later background reconnects (e.g. after a brief WiFi drop) so it doesn't keep
+  // interrupting normal use every time the connection flaps.
+  if (isFirstDashboardStart) {
+    display.clearDisplay();
+    display.drawRoundRect(4, 8, 120, 48, 6, SH110X_WHITE);
+    display.setFont(NULL);
+    display.setCursor(10, 14);
+    display.print("Dashboard:");
+    display.setCursor(10, 26);
+    display.print(WiFi.localIP().toString());
+    display.setCursor(10, 40);
+    display.print("or iris.local");
+    display.display();
+    delay(3000);
+  }
 }
 
 void updateWifiBackground() {

@@ -62,27 +62,69 @@ There is no companion app. WiFi is set up from your phone through a captive port
 
 ## Hardware
 
-| Part | Notes |
-|------|-------|
-| ESP32-C3 Super Mini | Single-core RISC-V, 2.4 GHz WiFi only |
-| SH1106 OLED, 128x64, I2C | Address `0x3C`. Many 1.3" modules use the SH1106. A 0.96" SSD1306 will not work with this driver without code changes |
-| MPU6050 breakout | 6-axis IMU on the same I2C bus. Address `0x68` (or `0x69`, both are checked) |
-| Touch sensor | Any digital touch module that outputs HIGH when touched (a TTP223 module works) |
+### Bill of materials
+
+| Part | Role |
+|------|------|
+| ESP32-C3 Super Mini | Main controller (single-core RISC-V, 2.4 GHz WiFi only) |
+| 1.3" OLED display, SH1106, I2C, 128x64 | The face and all pages. I2C address `0x3C`. A 0.96" SSD1306 needs code changes |
+| MPU6050 (GY-521 style breakout) | Tilt and shake sensing. I2C address `0x68` (`0x69` is also checked) |
+| TTP223 capacitive touch module | The only input. Reads LOW at rest and HIGH while touched |
+| TP4056 charging module (with battery protection) | Charges the LiPo from USB-C. Uses the `OUT+` and `OUT-` pads |
+| 3.7 V LiPo battery, 1000 mAh | Power source |
+| 4 mm slide switch | Main power switch on the battery output |
 | Jumper wires, USB-C cable | |
 
-No other hardware is needed. There is no buzzer, LED, or extra sensor.
+There is no buzzer, LED or other sensor.
 
 ## Wiring
 
-| Signal | ESP32-C3 pin |
-|--------|--------------|
-| I2C SDA (OLED and MPU6050) | GPIO 6 |
-| I2C SCL (OLED and MPU6050) | GPIO 7 |
-| Touch sensor output | GPIO 4 |
-| Power for all modules | 3V3 |
-| Ground | GND |
+### Power
 
-The OLED and the MPU6050 share the same two I2C lines. Pin numbers are defined at the top of the sketch (`SDA_PIN`, `SCL_PIN`, `TOUCH_PIN`) if you need to change them.
+| From | Pin | To | Pin | Notes |
+|------|-----|----|-----|-------|
+| LiPo battery | + | TP4056 | B+ | Battery positive to the charger |
+| LiPo battery | - | TP4056 | B- | Battery negative to the charger |
+| USB-C cable | 5 V | TP4056 | IN+ / IN- | Charging input only |
+| TP4056 | OUT+ | Slide switch | one terminal | Switched discharge line |
+| Slide switch | other terminal | ESP32-C3 | 5V | Powers the board when the switch is ON |
+| TP4056 | OUT- | ESP32-C3 | GND | Common ground |
+
+```
+                     +------------------+
+   USB-C  --------->| TP4056           |<--- B+ / B- ---  LiPo 3.7 V 1000 mAh
+                     |                  |
+                     | OUT+ ---- [ slide switch ] ---- ESP32-C3 5V
+                     | OUT- ------------------------- ESP32-C3 GND
+                     +------------------+
+```
+
+### Signals and peripherals
+
+| From | Pin | To | ESP32-C3 pin | Notes |
+|------|-----|----|--------------|-------|
+| OLED (SH1106) | VCC | ESP32-C3 | 3V3 | Most 1.3" SH1106 modules run on 3.3 V. Check that yours is not a 5 V-only variant |
+| OLED (SH1106) | GND | ESP32-C3 | GND | |
+| OLED (SH1106) | SDA | ESP32-C3 | GPIO 6 | Shared I2C bus |
+| OLED (SH1106) | SCL | ESP32-C3 | GPIO 7 | Shared I2C bus |
+| MPU6050 | VCC | ESP32-C3 | 3V3 | |
+| MPU6050 | GND | ESP32-C3 | GND | |
+| MPU6050 | SDA | ESP32-C3 | GPIO 6 | Same bus as the OLED, address `0x68` |
+| MPU6050 | SCL | ESP32-C3 | GPIO 7 | Same bus as the OLED, address `0x68` |
+| TTP223 | VCC | ESP32-C3 | 3V3 | |
+| TTP223 | GND | ESP32-C3 | GND | |
+| TTP223 | OUT / SIG | ESP32-C3 | GPIO 4 | Digital read, matches `TOUCH_PIN` in the code |
+
+The OLED and the MPU6050 share the same two I2C lines. The pin numbers are defined at the top of the sketch as `SDA_PIN`, `SCL_PIN` and `TOUCH_PIN` if you want to change them.
+
+### Power notes
+
+- **Check battery polarity twice** before connecting. A reversed LiPo can damage the module and is a fire risk.
+- **Use the protected TP4056 variant.** The circuit above uses the `OUT+` and `OUT-` pads, which are present on the version with the DW01 protection chip. That version cuts the battery off on over-discharge and short circuit. The plain version does not.
+- **Charge with the slide switch OFF.** A simple TP4056 board has no power-path management. If the load is running while it charges, the module may not detect end of charge correctly and the charge LED can be misleading.
+- **Flash with the slide switch OFF.** When you plug the ESP32-C3's own USB-C port into a computer, turn the switch off so the battery circuit and USB are not both feeding the 5V pin.
+- **The battery feeds the 5V pin.** The board's onboard 3.3 V regulator brings it down. A LiPo runs from about 4.2 V full to about 3.0 V empty, and depending on your board's regulator the ESP32 may brown out and reset before the battery is truly empty.
+- **No battery gauge and no deep sleep.** The firmware does not read the battery voltage and never sleeps, so runtime is limited by the OLED and WiFi. Battery life has not been measured.
 
 ## Software setup
 
@@ -100,21 +142,22 @@ The OLED and the MPU6050 share the same two I2C lines. Pin numbers are defined a
 
 ## Configuration
 
-All user settings are constants near the top of `iris_esp32.ino`.
+All user settings are constants near the top of `iris_esp32.ino`. **The API key and city are placeholders in this repository (`YOUR_API_KEY_HERE` and `YOUR_CITY_HERE`). Replace them before uploading.**
 
 | Constant | Purpose |
 |----------|---------|
-| `OPENWEATHER_API_KEY` | Your free API key from [openweathermap.org](https://openweathermap.org/api) |
-| `CITY`, `COUNTRY_CODE` | Location used for weather, e.g. `"Bengaluru"`, `"IN"` |
-| `TIMEZONE` | POSIX timezone string, e.g. `"IST-5:30"` for India. Note the sign is inverted in POSIX format, so UTC+5:30 is written `IST-5:30` |
-| `AP_SETUP_PASSWORD` | Password for the `IRIS-Setup` access point. Must be 8 to 63 characters |
+| `OPENWEATHER_API_KEY` | Your own free API key from [openweathermap.org](https://openweathermap.org/api), replacing `YOUR_API_KEY_HERE`. Required for weather, the forecast, weather moods and weather reactions. Without it those features do not work, but the rest of IRIS still runs |
+| `CITY` | Your city, replacing `YOUR_CITY_HERE`, e.g. `"London"` |
+| `COUNTRY_CODE` | Two-letter country code for your city, e.g. `"GB"`. Check that it matches the city you set |
+| `TIMEZONE` | POSIX timezone string, e.g. `"IST-5:30"` for India or `"EST5EDT,M3.2.0,M11.1.0"` for US Eastern. The sign is inverted in POSIX format, so UTC+5:30 is written `IST-5:30` |
+| `AP_SETUP_PASSWORD` | Password for the `IRIS-Setup` access point. Defaults to `iris1234` so first-time setup is easy. Change it to anything from 8 to 63 characters |
 
-Do not commit a real API key to a public repository. See [Security notes](#security-notes).
+New OpenWeatherMap keys can take a while to activate after you create them.
 
 ## First boot and WiFi setup
 
 1. On first boot there are no saved credentials, so IRIS starts a WiFi access point named **IRIS-Setup**. The OLED shows the network name, password and address.
-2. Join `IRIS-Setup` from your phone using `AP_SETUP_PASSWORD` (default `iris1234`).
+2. Join `IRIS-Setup` from your phone. The default password is `iris1234`, or whatever you set in `AP_SETUP_PASSWORD`. The password is also shown on the OLED.
 3. A setup page should open automatically. If it does not, open `http://192.168.4.1` in a browser.
 4. Pick your network from the list (bars show signal strength, `[####]` is strongest), enter the password, and tap **Save & Connect**.
 5. IRIS restarts, connects, plays a short celebration, and shows its dashboard address for a few seconds.
@@ -219,6 +262,10 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 
 ## Troubleshooting
 
+**IRIS does not turn on from the battery.** Check that the slide switch is ON, the battery is charged, and the switch is wired between `OUT+` and the ESP32-C3 `5V` pin. Confirm battery polarity at the TP4056 `B+` and `B-` pads.
+
+**IRIS resets or reboots on battery.** The battery is probably low. See the power notes in the Wiring section.
+
 **Blank screen.** Check the wiring and that your OLED is an SH1106 at `0x3C`. Serial prints a note if the display is not found.
 
 **"MPU6050 NOT FOUND" on screen.** Check SDA and SCL wiring and power. The sketch looks for the sensor at `0x68` and `0x69`.
@@ -231,7 +278,7 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 
 **IRIS keeps opening the setup portal.** Either the saved network is out of range or the password is wrong. The ESP32-C3 supports 2.4 GHz only, so a 5 GHz-only network will never be visible.
 
-**Weather does not update.** Confirm the API key is valid and activated (new OpenWeatherMap keys can take a while to work) and that `CITY` and `COUNTRY_CODE` are correct.
+**Weather does not update.** Confirm you replaced `YOUR_API_KEY_HERE` and `YOUR_CITY_HERE`, that the key is valid and activated (new OpenWeatherMap keys can take a while to work), and that `COUNTRY_CODE` matches your city.
 
 **`undefined reference to setup()` or `loop()` at link time.** Arduino's automatic prototype generator can misfire on complex sketches. This sketch declares its functions explicitly to avoid it. If you add new functions and see this error, add forward declarations for them next to the existing block.
 
@@ -240,15 +287,15 @@ curl -X POST --data-urlencode "text=Stand up and stretch" -d "time=16:30" http:/
 - The dashboard has no authentication and uses plain HTTP. Anyone on your local network can control IRIS.
 - Reminders, timer presets and Pomodoro state are not saved across reboots.
 - Long animations (weather reactions, page transitions, the boom) briefly block the main loop, so the dashboard can respond a little slower during them.
-- Stopping a Pomodoro session with the touch sensor (double tap or hold-to-cancel) does not clear Pomodoro mode. Use **Stop** on the dashboard to end Pomodoro cleanly.
 - Weather-change reactions are skipped if IRIS is busy with something else when the reading arrives.
 - Page transitions apply to single-tap navigation only. Switching subpages is instant.
 
 ## Security notes
 
-- The OpenWeatherMap API key and `AP_SETUP_PASSWORD` are plain strings in the sketch. Before publishing your own fork, replace them with placeholders or move them into a `secrets.h` file listed in `.gitignore`.
-- Change the default `AP_SETUP_PASSWORD`. Anyone who knows it and is within range can open the setup portal while it is active.
+- The OpenWeatherMap API key in this repository is a placeholder. Use your own, and do not commit it if you publish a fork. A `secrets.h` file listed in `.gitignore` is a simple way to keep it out.
+- The default `AP_SETUP_PASSWORD` (`iris1234`) is published here on purpose so first-time setup is easy. It only matters while the setup portal is open: on first boot, after forgetting the network, or when the saved network is out of range. If that matters to you, change the constant before flashing.
 - WiFi credentials are stored unencrypted in the ESP32's NVS flash.
+- The dashboard has no login and uses plain HTTP (see Known limitations).
 
 ## Project structure
 
