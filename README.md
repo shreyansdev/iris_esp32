@@ -90,13 +90,41 @@ There is no buzzer, LED or other sensor.
 | Slide switch | other terminal | ESP32-C3 | 5V | Powers the board when the switch is ON |
 | TP4056 | OUT- | ESP32-C3 | GND | Common ground |
 
-```
-                     +------------------+
-   USB-C  --------->| TP4056           |<--- B+ / B- ---  LiPo 3.7 V 1000 mAh
-                     |                  |
-                     | OUT+ ---- [ slide switch ] ---- ESP32-C3 5V
-                     | OUT- ------------------------- ESP32-C3 GND
-                     +------------------+
+```mermaid
+flowchart LR
+    USB["USB-C<br/>5 V charging input"]
+
+    subgraph CHG["TP4056 charging module"]
+        IN["IN+ / IN-"]
+        BAT["B+ / B-"]
+        OUT["OUT+ / OUT-"]
+    end
+
+    LIPO[("LiPo battery<br/>3.7 V, 1000 mAh")]
+    SW{{"Slide switch<br/>main power ON / OFF"}}
+
+    subgraph MCU["ESP32-C3 Super Mini"]
+        V5["5V pin"]
+        GND["GND"]
+    end
+
+    USB -->|"5 V"| IN
+    BAT <-->|"charge / discharge"| LIPO
+    OUT -->|"OUT+"| SW
+    SW -->|"switched +"| V5
+    OUT -.->|"OUT- (common ground)"| GND
+
+    classDef source fill:#e8f1ff,stroke:#2563eb,stroke-width:2px,color:#0f172a
+    classDef module fill:#f1f5f9,stroke:#475569,stroke-width:1.5px,color:#0f172a
+    classDef battery fill:#fff4e0,stroke:#d97706,stroke-width:2px,color:#0f172a
+    classDef switch fill:#fde8e8,stroke:#dc2626,stroke-width:2px,color:#0f172a
+    classDef mcu fill:#e7f8ee,stroke:#16a34a,stroke-width:1.5px,color:#0f172a
+
+    class USB source
+    class IN,BAT,OUT module
+    class LIPO battery
+    class SW switch
+    class V5,GND mcu
 ```
 
 ### Signals and peripherals
